@@ -1,0 +1,92 @@
+name: OPA Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Project folder to run the validation on'
+        required: true
+        type: string
+      resource:
+        description: 'Resource Name to validate'
+        required: true
+        type: string
+
+jobs:
+  opa_validation:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code   
+      uses: actions/checkout@v3
+
+    - name: Checking for Terraform Project and Rego Policy
+      run: |
+        echo "Entered project name: ${{ github.event.inputs.project }}"
+        echo "Entered resource name: ${{ github.event.inputs.resource }}"
+        if [ ! -d "${{ github.workspace }}/${{ github.event.inputs.project }}" ]; then
+          echo "Error: Project directory '${{ github.event.inputs.project }}' not found."
+          exit 1
+        fi
+        echo "Project directory '${{ github.event.inputs.project }}' found."
+        resource_type="${{ github.event.inputs.resource }}"
+        if [ ! -f "${{ github.workspace }}/rego_policies/${resource_type}.rego" ]; then
+          echo "Error: Rego policy '${resource_type}.rego' not found."
+          exit 1
+        fi
+        echo "Rego policy '${resource_type}.rego' found."
+
+    - name: Install Terraform | AWS CLI | OPA
+      run: |
+        sudo apt-get update && \
+        sudo apt-get install -y gnupg software-properties-common && \
+        curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add - && \
+        sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main" && \
+        sudo apt-get update && \
+        sudo apt-get install -y terraform awscli
+        sudo mkdir -p /opt/opa
+        curl -L -o /opt/opa/opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64
+        chmod 755 /opt/opa/opa
+        sudo ln -s /opt/opa/opa /usr/local/bin/opa
+        
+    - name : Version Check
+      run: | 
+        echo "TERRAFORM VERSION"
+        terraform version
+        echo "AWS CLI VERSION"
+        aws --version
+        echo "OPA VERSION"
+        opa version
+        
+    - name: Set up AWS credentials
+      env:
+        AWS_ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY }}
+        AWS_SECRET_KEY: ${{ secrets.AWS_SECRET_KEY }}
+      run: aws configure set aws_access_key_id $AWS_ACCESS_KEY && aws configure set aws_secret_access_key $AWS_SECRET_KEY
+        
+    - name: Terraform INIT | Terraform PLAN | PLAN to JSON
+      run: |
+        terraform init
+        terraform plan -var-file=variables.tfvars -out=plan.tfplan
+        terraform show -json plan.tfplan > plan.json
+      working-directory: ${{ github.workspace }}/${{ inputs.project }}
+
+    - name: Run Python script to filter resources
+      run: |
+        python3 ${{ github.workspace }}/scripts/terraform_resource_filter.py ${{ github.workspace }}/${{ inputs.project }}/plan.json ${{ github.event.inputs.resource }}
+
+    - name: Run OPA evaluation and save output
+      run: |
+        temp_dir="${{ github.workspace }}/${{ inputs.project }}/temp"
+        results_dir="${{ github.workspace }}/${{ inputs.project }}/result"
+        mkdir -p "$results_dir"
+        for json_file in "$temp_dir"/*.json; do
+          filename=$(basename "$json_file")
+          output_file="$results_dir/${filename%.*}.json"  
+
+          echo "Evaluating $json_file"
+          /opt/opa/opa eval -i "$json_file" -d "${{ github.workspace }}/rego_policies/${{ github.event.inputs.resource }}.rego" "data.play" > "$output_file"
+          echo "Output for $filename:" >> "$output_file"
+          cat "$output_file"
+        done
+      working-directory: ${{ github.workspace }}
